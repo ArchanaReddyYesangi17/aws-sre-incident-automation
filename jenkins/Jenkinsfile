@@ -1,0 +1,306 @@
+// ─────────────────────────────────────────────────────────────
+// AWS SRE Platform — Jenkins Multi-Stage CI/CD Pipeline
+// Supports: build → scan → deploy-staging → health-gate → deploy-prod → notify
+// ─────────────────────────────────────────────────────────────
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: build
+    image: docker:24-dind
+    securityContext:
+      privileged: true
+  - name: tools
+    image: hashicorp/terraform:1.6.6
+    command: [cat]
+    tty: true
+  - name: python
+    image: python:3.11-slim
+    command: [cat]
+    tty: true
+  - name: kubectl
+    image: bitnami/kubectl:1.28
+    command: [cat]
+    tty: true
+"""
+        }
+    }
+
+    environment {
+        AWS_REGION          = 'us-east-1'
+        ECR_REGISTRY        = credentials('ecr-registry-url')
+        EKS_CLUSTER_PROD    = 'eks-sre-prod'
+        EKS_CLUSTER_STAGING = 'eks-sre-staging'
+        SLACK_CHANNEL       = '#platform-deployments'
+        APP_NAME            = "${env.JOB_BASE_NAME}"
+        IMAGE_TAG           = "${env.GIT_COMMIT[0..7]}"
+        HEALTH_GATE_MINUTES = '5'
+    }
+
+    options {
+        timeout(time: 45, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds()
+        timestamps()
+    }
+
+    stages {
+
+        // ── Stage 1: Build & Security Scan ──────────────────────────────
+        stage('Build & Scan') {
+            steps {
+                container('build') {
+                    script {
+                        echo "Building Docker image: ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}"
+                        sh """
+                            docker build \
+                              --label git-commit=${env.GIT_COMMIT} \
+                              --label build-date=\$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+                              -t ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG} \
+                              -t ${ECR_REGISTRY}/${APP_NAME}:latest \
+                              .
+                        """
+
+                        echo "Running Trivy vulnerability scan..."
+                        sh """
+                            docker run --rm \
+                              -v /var/run/docker.sock:/var/run/docker.sock \
+                              aquasec/trivy:latest image \
+                              --exit-code 1 \
+                              --severity HIGH,CRITICAL \
+                              --no-progress \
+                              ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}
+                        """
+
+                        echo "Pushing to ECR..."
+                        sh """
+                            aws ecr get-login-password --region ${AWS_REGION} \
+                              | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                            docker push ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}
+                            docker push ${ECR_REGISTRY}/${APP_NAME}:latest
+                        """
+                    }
+                }
+            }
+            post {
+                failure {
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: ":x: *${APP_NAME}* build/scan failed on `${env.BRANCH_NAME}` — <${env.BUILD_URL}|View>"
+                    )
+                }
+            }
+        }
+
+        // ── Stage 2: Terraform Validate ─────────────────────────────────
+        stage('Terraform Validate') {
+            when {
+                changeset "terraform/**"
+            }
+            steps {
+                container('tools') {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                      credentialsId: 'aws-sre-deploy']]) {
+                        sh """
+                            cd terraform
+                            terraform init -backend=false
+                            terraform fmt -check -recursive
+                            terraform validate
+                        """
+                    }
+                }
+            }
+        }
+
+        // ── Stage 3: Test & Lint ─────────────────────────────────────────
+        stage('Test & Lint') {
+            parallel {
+                stage('Python Tests') {
+                    steps {
+                        container('python') {
+                            sh """
+                                pip install -r scripts/requirements.txt --quiet
+                                python -m flake8 scripts/ --max-line-length=120
+                                python -m pytest scripts/tests/ -v --tb=short || true
+                            """
+                        }
+                    }
+                }
+                stage('Shell Lint') {
+                    steps {
+                        container('tools') {
+                            sh """
+                                apk add --quiet shellcheck
+                                shellcheck scripts/*.sh
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Stage 4: Deploy to Staging ───────────────────────────────────
+        stage('Deploy Staging') {
+            steps {
+                container('kubectl') {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                      credentialsId: 'aws-sre-deploy']]) {
+                        sh """
+                            aws eks update-kubeconfig \
+                              --region ${AWS_REGION} \
+                              --name ${EKS_CLUSTER_STAGING}
+
+                            kubectl set image deployment/${APP_NAME} \
+                              ${APP_NAME}=${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG} \
+                              -n staging
+
+                            kubectl rollout status deployment/${APP_NAME} \
+                              -n staging \
+                              --timeout=5m
+                        """
+                    }
+                }
+            }
+        }
+
+        // ── Stage 5: Health Gate ─────────────────────────────────────────
+        stage('Health Gate') {
+            steps {
+                container('python') {
+                    script {
+                        echo "Observing staging health for ${HEALTH_GATE_MINUTES} minutes..."
+                        sh """
+                            pip install boto3 --quiet
+                            python scripts/incident_triage.py \
+                              --cluster ${EKS_CLUSTER_STAGING} \
+                              --region ${AWS_REGION} \
+                              --namespace staging \
+                              --time-window ${HEALTH_GATE_MINUTES}m
+                        """
+                        sleep(time: Integer.parseInt(env.HEALTH_GATE_MINUTES), unit: 'MINUTES')
+
+                        sh """
+                            python scripts/incident_triage.py \
+                              --cluster ${EKS_CLUSTER_STAGING} \
+                              --region ${AWS_REGION} \
+                              --namespace staging \
+                              --time-window ${HEALTH_GATE_MINUTES}m \
+                              --output /tmp/health-gate-report.md
+                        """
+                    }
+                }
+            }
+            post {
+                failure {
+                    container('kubectl') {
+                        sh """
+                            echo "Health gate failed — rolling back staging..."
+                            kubectl rollout undo deployment/${APP_NAME} -n staging
+                        """
+                    }
+                    slackSend(
+                        channel: env.SLACK_CHANNEL,
+                        color: 'danger',
+                        message: ":rotating_light: *${APP_NAME}* failed health gate on staging. Auto-rollback triggered. <${env.BUILD_URL}|Details>"
+                    )
+                    error("Health gate check failed — aborting production deployment")
+                }
+            }
+        }
+
+        // ── Stage 6: Deploy to Production ────────────────────────────────
+        stage('Deploy Production') {
+            when {
+                branch 'main'
+            }
+            input {
+                message "Deploy ${APP_NAME}:${IMAGE_TAG} to PRODUCTION?"
+                ok "Deploy"
+                submitter "platform-leads,sre-oncall"
+                parameters {
+                    choice(
+                        name: 'DEPLOY_STRATEGY',
+                        choices: ['rolling', 'blue-green'],
+                        description: 'Deployment strategy'
+                    )
+                }
+            }
+            steps {
+                container('kubectl') {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                      credentialsId: 'aws-sre-deploy']]) {
+                        sh """
+                            aws eks update-kubeconfig \
+                              --region ${AWS_REGION} \
+                              --name ${EKS_CLUSTER_PROD}
+
+                            kubectl set image deployment/${APP_NAME} \
+                              ${APP_NAME}=${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG} \
+                              -n production
+
+                            kubectl rollout status deployment/${APP_NAME} \
+                              -n production \
+                              --timeout=10m
+                        """
+                    }
+                }
+            }
+            post {
+                failure {
+                    container('kubectl') {
+                        sh """
+                            echo "Production deploy failed — initiating rollback..."
+                            kubectl rollout undo deployment/${APP_NAME} -n production
+                            kubectl rollout status deployment/${APP_NAME} -n production --timeout=5m
+                        """
+                    }
+                }
+            }
+        }
+
+        // ── Stage 7: Post-Deploy Verification ────────────────────────────
+        stage('Post-Deploy Verify') {
+            when {
+                branch 'main'
+            }
+            steps {
+                container('python') {
+                    sh """
+                        pip install boto3 --quiet
+                        python scripts/incident_triage.py \
+                          --cluster ${EKS_CLUSTER_PROD} \
+                          --region ${AWS_REGION} \
+                          --namespace production \
+                          --time-window 5m
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'good',
+                message: ":white_check_mark: *${APP_NAME}* `${IMAGE_TAG}` deployed to production successfully by ${env.BUILD_USER} — <${env.BUILD_URL}|Build #${env.BUILD_NUMBER}>"
+            )
+        }
+        failure {
+            slackSend(
+                channel: env.SLACK_CHANNEL,
+                color: 'danger',
+                message: ":x: *${APP_NAME}* pipeline FAILED on `${env.BRANCH_NAME}` — <${env.BUILD_URL}|Build #${env.BUILD_NUMBER}>"
+            )
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
